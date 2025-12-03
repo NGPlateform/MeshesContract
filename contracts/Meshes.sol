@@ -44,9 +44,19 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
     // ============ 时间相关常量 ============
     /** @dev 一天的秒数 */
     uint256 private constant SECONDS_IN_DAY = 86400;
+
+    /** @dev 单次衰减处理允许的最大天数，避免一次性循环过大消耗 gas */
+    uint256 private constant MAX_DECAY_DAYS_PER_CALL = 365;
     
     /** @dev 总铸造持续时间：10年，用于计算代币衰减 */
     uint256 private constant TOTAL_MINT_DURATION = 10 * 365 * SECONDS_IN_DAY; // 10年
+    
+    // ============ 测试模式时间常量 ============
+    /** @dev 测试模式：首次提现冷却时间（10分钟） */
+    uint256 private constant TEST_FIRST_WITHDRAW_COOLDOWN = 600; // 10分钟
+    
+    /** @dev 测试模式：年衰减周期（10分钟） */
+    uint256 private constant TEST_YEAR_PERIOD_SECONDS = 600; // 10分钟
     
     // 已废弃的常量（保留用于历史记录）
     //    uint256 public constant MAX_TOTAL_SUPPLY = 81_000_000_000 * 10**18; // 81亿枚
@@ -336,24 +346,27 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @dev 计算指定日期的日铸造因子
-     * @param dayIndex 日索引（相对于创世时间）
-     * @return 该日的铸造因子（1e10 = 100%）
+     * @dev 计算当前时间的日铸造因子（测试模式：基于10分钟周期）
+     * @return 当前的铸造因子（1e10 = 100%）
      * 
      * 算法说明：
      * - 基础因子：F0 = 1e10 (100%)
-     * - 年衰减：每年衰减10%，即乘以0.9
-     * - 公式：Fd = F0 * (0.9 ^ yearIndex)
+     * - 年衰减：每10分钟（测试模式）衰减10%，即乘以0.9
+     * - 公式：Fd = F0 * (0.9 ^ yearPeriodIndex)
      * - 使用整数运算避免浮点数精度问题
+     * @notice 测试模式下，dayIndex 参数不再使用，直接基于当前时间计算
      */
-    function _dailyMintFactorForDay(uint256 dayIndex) private pure returns (uint256) {
-        uint256 yearIndex = dayIndex / 365;
+    function _dailyMintFactorForDay(uint256 /* dayIndex - 测试模式下未使用 */) private view returns (uint256) {
+        // 测试模式：基于10分钟周期计算衰减
+        // 计算从创世时间开始的10分钟周期索引
+        uint256 currentTime = block.timestamp;
+        uint256 yearPeriodIndex = (currentTime - genesisTs) / TEST_YEAR_PERIOD_SECONDS;
         
         // 快速幂（定点 1e10，不缩放底数，仅整数比例）
-        // 预计算 0.9^n 的 1e10 定点：逐年乘以 0.9（用 9/10 近似）
+        // 预计算 0.9^n 的 1e10 定点：每周期乘以 0.9（用 9/10 近似）
         uint256 factor = 1e10;
-        for (uint256 i = 0; i < yearIndex; i++) {
-            factor = (factor * 9) / 10; // 每年衰减 10%
+        for (uint256 i = 0; i < yearPeriodIndex; i++) {
+            factor = (factor * 9) / 10; // 每10分钟周期衰减 10%
             if (factor == 0) break; // 防止下溢
         }
         return factor;
@@ -371,7 +384,7 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
      * - n 是区间内的天数
      * - 使用整数运算避免精度损失
      */
-    function _sumDailyMintFactor(uint256 a, uint256 b) private pure returns (uint256) {
+    function _sumDailyMintFactor(uint256 a, uint256 b) private view returns (uint256) {
         if (b < a) return 0; // 无效区间
         uint256 n = b - a + 1; // 区间内的天数
         uint256 first = _dailyMintFactorForDay(a); // 起始日因子
@@ -422,8 +435,8 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
      * - 地址验证：不能为零地址
      * - 重复检查：不能设置为相同地址
      * - 首次设置：从 address(0) 设置时跳过白名单检查
-     * - Owner治理模式：Owner可以多次修改，无需白名单检查
-     * - Safe治理模式：需要白名单检查
+     * - Owner治理模式：Owner可以多次修改
+     * - Safe治理模式：治理可以自由迁移地址
      * - 事件记录：便于追踪地址变更
      */
     function setTreasuryAddress(
@@ -448,18 +461,9 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
             return;
         }
         
-        // Safe治理模式下，后续修改需要白名单检查
-        require(_isApprovedByCurrentTreasury(_newTreasuryAddr), "New treasury not approved by current treasury");
+        // Safe治理模式下，不再依赖旧 Treasury 的白名单回调，确保治理可自由迁移地址
         treasuryAddress = _newTreasuryAddr;
         emit TreasuryAddressUpdated(oldTreasury, _newTreasuryAddr);
-    }
-
-    // 仅用于只读校验：查询当前 Treasury（若为合约且实现方法）对白名单的认可
-    function _isApprovedByCurrentTreasury(address candidate) internal view returns (bool) {
-        bytes4 sel = bytes4(keccak256("isRecipientApproved(address)"));
-        (bool ok, bytes memory data) = treasuryAddress.staticcall(abi.encodeWithSelector(sel, candidate));
-        if (!ok || data.length == 0) return false;
-        return abi.decode(data, (bool));
     }
 
     /**
@@ -659,7 +663,7 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
 
         uint256 cd = _currentDayIndex();
         if (cd > 0) {
-            _applyUnclaimedDecay(_user, cd);
+            _applyUnclaimedDecay(_user, cd, false);
         }
 
         mintInfo.meshID = _meshID;
@@ -758,15 +762,16 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
      * - 暂停机制：紧急情况下可暂停
      * - 时间限制：防止频繁提取
      * - 余额检查：确保有足够的代币可提取
+     * - 若积压天数超过 MAX_DECAY_DAYS_PER_CALL，需要先调用 processUnclaimedDecay 分批推进
      */
     function withdraw() public nonReentrant whenNotPaused {
         uint256 dayIndex = _currentDayIndex();
         require(userClaimCounts[msg.sender] > 0, "No claims");
         
-        // 首次提现需满足：距首次认领已满24小时；之后按“每天一次”限制
+        // 首次提现需满足：距首次认领已满10分钟（测试模式）；之后按"每天一次"限制
         if (!hasWithdrawn[msg.sender]) {
             uint256 firstClaimTime = firstClaimTimestamp[msg.sender];
-            require(firstClaimTime > 0 && block.timestamp >= firstClaimTime + 24 * HOUR_SECONDS, "First claim cooldown");
+            require(firstClaimTime > 0 && block.timestamp >= firstClaimTime + TEST_FIRST_WITHDRAW_COOLDOWN, "First claim cooldown");
         } else {
             require(dayIndex > lastWithdrawDay[msg.sender], "Daily receive");
         }
@@ -782,7 +787,7 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
         require(weight > 0, "Zero weight");
 
         // 先对未领余额做“日衰减 50%”的懒结算（逐日推进到昨天）
-        _applyUnclaimedDecay(user, dayIndex);
+        _applyUnclaimedDecay(user, dayIndex, false);
 
         // 处理今日领取：今日应得 + 结转余额一次性发放
         uint256 todayAmount = (dailyMintFactor * weight) / 1e10;
@@ -824,7 +829,7 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
             if (firstClaimTime == 0) {
                 return (false, 0);
             }
-            uint256 timeLimit = firstClaimTime + 24 * HOUR_SECONDS;
+            uint256 timeLimit = firstClaimTime + TEST_FIRST_WITHDRAW_COOLDOWN;
             canWithdraw = block.timestamp >= timeLimit;
             nextWithdrawTime = timeLimit;
             return (canWithdraw, nextWithdrawTime);
@@ -852,22 +857,62 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
         _maybePayoutTreasury();
     }
 
+    /**
+     * @dev 外部衰减推进入口，允许按批次处理超出上限的历史天数
+     * @param user 需要处理的用户地址
+     * @param upToDay 目标日索引（相对创世）；传 0 或超过当前天将自动取当前天
+     * @return fullyProcessed 是否已经处理到指定 upToDay
+     * @return processedDays 本次处理的天数
+     */
+    function processUnclaimedDecay(address user, uint256 upToDay)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (bool fullyProcessed, uint256 processedDays)
+    {
+        require(user != address(0), "Invalid user");
+        require(userClaimCounts[user] > 0, "No claims");
+
+        uint256 currentDay = _currentDayIndex();
+        if (upToDay == 0 || upToDay > currentDay) {
+            upToDay = currentDay;
+        }
+
+        uint256 previous = lastProcessedDay[user];
+        require(upToDay > previous, "No pending decay");
+
+        fullyProcessed = _applyUnclaimedDecay(user, upToDay, true);
+        processedDays = lastProcessedDay[user] > previous ? (lastProcessedDay[user] - previous) : 0;
+    }
+
     // 按天精确推进未领余额的"日衰减 50%"直至 upToDay-1
-    function _applyUnclaimedDecay(address user, uint256 upToDay) private {
+    function _applyUnclaimedDecay(address user, uint256 upToDay, bool allowPartial) private returns (bool fullyProcessed) {
         uint256 fromDay = lastProcessedDay[user];
         if (fromDay >= upToDay) {
-            return;
+            return true;
         }
+
+        uint256 targetDay = upToDay;
+        uint256 daysToProcess = upToDay - fromDay;
+        if (daysToProcess > MAX_DECAY_DAYS_PER_CALL) {
+            require(allowPartial, "Decay range exceeds limit");
+            targetDay = fromDay + MAX_DECAY_DAYS_PER_CALL;
+            daysToProcess = MAX_DECAY_DAYS_PER_CALL;
+            fullyProcessed = false;
+        } else {
+            fullyProcessed = true;
+        }
+
         uint256 weight = userWeightSum[user];
         if (weight == 0) {
-            lastProcessedDay[user] = upToDay - 1;
-            return;
+            lastProcessedDay[user] = targetDay - 1;
+            return fullyProcessed;
         }
-        uint256 daysProcessed = 0;
+
         uint256 burnedTotal = 0;
         uint256 treasuryTotal = 0;
         uint256 carry = carryBalance[user];
-        for (uint256 d = fromDay; d < upToDay; d++) {
+        for (uint256 d = fromDay; d < targetDay; d++) {
             uint256 factorD = _dailyMintFactorForDay(d);
             uint256 Rd = (factorD * weight) / 1e10;
             uint256 Xd = carry + Rd;
@@ -878,8 +923,8 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
                 burnedTotal += burnD;
                 treasuryTotal += treasuryD;
             }
-            daysProcessed++;
         }
+
         if (burnedTotal > 0) {
             mint(address(this), burnedTotal);
             _burn(address(this), burnedTotal);
@@ -891,9 +936,12 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
             pendingTreasuryPool += treasuryTotal;
             emit TreasuryFeeAccrued(treasuryTotal, block.timestamp);
         }
+
         carryBalance[user] = carry;
-        lastProcessedDay[user] = upToDay - 1;
-        emit UnclaimedDecayApplied(user, daysProcessed, burnedTotal, treasuryTotal, carry);
+        lastProcessedDay[user] = targetDay - 1;
+        emit UnclaimedDecayApplied(user, daysToProcess, burnedTotal, treasuryTotal, carry);
+
+        return fullyProcessed;
     }
 
     function getMeshInfo(string calldata _meshID) external view returns (
@@ -914,7 +962,8 @@ contract Meshes is ERC20, ReentrancyGuard, Pausable, Ownable {
         if (cnt == 0 || burnScaleMilli == 0) {
             costBurned = 0;
         } else {
-            uint256 baseCost = (BASE_BURN_AMOUNT * heat * heat) / denom;
+            uint256 scaledHeatSq = (heat * heat) / 1 ether;
+            uint256 baseCost = (BASE_BURN_AMOUNT * scaledHeatSq) / denom;
             costBurned = (baseCost * burnScaleMilli) / 1000;
         }
     }
